@@ -1,0 +1,629 @@
+name: Microservices CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+jobs:
+  # Detect changed services
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      adservice: ${{ steps.changes.outputs.adservice }}
+      cartservice: ${{ steps.changes.outputs.cartservice }}
+      checkoutservice: ${{ steps.changes.outputs.checkoutservice }}
+      currencyservice: ${{ steps.changes.outputs.currencyservice }}
+      emailservice: ${{ steps.changes.outputs.emailservice }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+      paymentservice: ${{ steps.changes.outputs.paymentservice }}
+      productcatalogservice: ${{ steps.changes.outputs.productcatalogservice }}
+      recommendationservice: ${{ steps.changes.outputs.recommendationservice }}
+      shippingservice: ${{ steps.changes.outputs.shippingservice }}
+      loadgenerator: ${{ steps.changes.outputs.loadgenerator }}
+      kubernetes-manifests: ${{ steps.changes.outputs.kubernetes-manifests }}
+      helm-chart: ${{ steps.changes.outputs.helm-chart }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            adservice:
+              - 'src/adservice/**'
+            cartservice:
+              - 'src/cartservice/**'
+            checkoutservice:
+              - 'src/checkoutservice/**'
+            currencyservice:
+              - 'src/currencyservice/**'
+            emailservice:
+              - 'src/emailservice/**'
+            frontend:
+              - 'src/frontend/**'
+            paymentservice:
+              - 'src/paymentservice/**'
+            productcatalogservice:
+              - 'src/productcatalogservice/**'
+            recommendationservice:
+              - 'src/recommendationservice/**'
+            shippingservice:
+              - 'src/shippingservice/**'
+            loadgenerator:
+              - 'src/loadgenerator/**'
+            kubernetes-manifests:
+              - 'kubernetes-manifests/**'
+              - 'helm-chart/**'
+            helm-chart:
+              - 'helm-chart/**'
+
+  # Security and Quality Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Run Trivy vulnerability scanner in repo mode
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Checkov action
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,kubernetes
+
+  # Java Service - AdService
+  build-adservice:
+    needs: [detect-changes, security-scan]
+    if: needs.detect-changes.outputs.adservice == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+      
+      - name: Cache Gradle packages
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      
+      - name: Run tests
+        working-directory: ./src/adservice
+        run: |
+          chmod +x gradlew
+          ./gradlew test
+      
+      - name: Run integration tests
+        working-directory: ./src/adservice
+        run: ./gradlew integrationTest
+      
+      - name: Generate test report
+        uses: dorny/test-reporter@v1
+        if: success() || failure()
+        with:
+          name: AdService Tests
+          path: src/adservice/build/test-results/test/*.xml
+          reporter: java-junit
+      
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: src/adservice
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      
+      - name: Build application
+        working-directory: ./src/adservice
+        run: ./gradlew build
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_USERNAME }}/adservice
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./src/adservice
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # .NET Service - CartService
+  build-cartservice:
+    needs: [detect-changes, security-scan]
+    if: needs.detect-changes.outputs.cartservice == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '6.0.x'
+      
+      - name: Restore dependencies
+        working-directory: ./src/cartservice
+        run: dotnet restore
+      
+      - name: Build
+        working-directory: ./src/cartservice
+        run: dotnet build --no-restore
+      
+      - name: Test
+        working-directory: ./src/cartservice
+        run: dotnet test --no-build --verbosity normal --collect:"XPlat Code Coverage" --results-directory ./coverage
+      
+      - name: Code Coverage Report
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: src/cartservice/coverage/**/coverage.cobertura.xml
+          badge: true
+          fail_below_min: true
+          format: markdown
+          hide_branch_rate: false
+          hide_complexity: true
+          indicators: true
+          output: both
+          thresholds: '60 80'
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_USERNAME }}/cartservice
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./src/cartservice/src
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Go Services - CheckoutService, Frontend, ProductCatalogService, ShippingService
+  build-go-services:
+    needs: [detect-changes, security-scan]
+    if: |
+      needs.detect-changes.outputs.checkoutservice == 'true' ||
+      needs.detect-changes.outputs.frontend == 'true' ||
+      needs.detect-changes.outputs.productcatalogservice == 'true' ||
+      needs.detect-changes.outputs.shippingservice == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [checkoutservice, frontend, productcatalogservice, shippingservice]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check if service changed
+        id: check
+        run: |
+          if [ "${{ needs.detect-changes.outputs[matrix.service] }}" == "true" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Set up Go
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.19'
+      
+      - name: Cache Go modules
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      
+      - name: Download dependencies
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: go mod download
+      
+      - name: Run tests
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: go test -v -race -coverprofile=coverage.out ./...
+      
+      - name: Upload coverage reports to Codecov
+        if: steps.check.outputs.changed == 'true'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./src/${{ matrix.service }}/coverage.out
+          flags: ${{ matrix.service }}
+      
+      - name: Run gosec Security Scanner
+        if: steps.check.outputs.changed == 'true'
+        uses: securecodewarrior/github-action-gosec@master
+        with:
+          args: './src/${{ matrix.service }}/...'
+      
+      - name: Build binary
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+      
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        if: steps.check.outputs.changed == 'true'
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_USERNAME }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/build-push-action@v4
+        with:
+          context: ./src/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Node.js Services - CurrencyService, PaymentService
+  build-nodejs-services:
+    needs: [detect-changes, security-scan]
+    if: |
+      needs.detect-changes.outputs.currencyservice == 'true' ||
+      needs.detect-changes.outputs.paymentservice == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [currencyservice, paymentservice]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check if service changed
+        id: check
+        run: |
+          if [ "${{ needs.detect-changes.outputs[matrix.service] }}" == "true" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Set up Node.js
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+          cache-dependency-path: src/${{ matrix.service }}/package-lock.json
+      
+      - name: Install dependencies
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: npm ci
+      
+      - name: Run ESLint
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: npx eslint . --ext .js
+      
+      - name: Run tests
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: npm test
+      
+      - name: Run security audit
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: npm audit --audit-level high
+      
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        if: steps.check.outputs.changed == 'true'
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_USERNAME }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/build-push-action@v4
+        with:
+          context: ./src/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Python Services - EmailService, RecommendationService, LoadGenerator
+  build-python-services:
+    needs: [detect-changes, security-scan]
+    if: |
+      needs.detect-changes.outputs.emailservice == 'true' ||
+      needs.detect-changes.outputs.recommendationservice == 'true' ||
+      needs.detect-changes.outputs.loadgenerator == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [emailservice, recommendationservice, loadgenerator]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check if service changed
+        id: check
+        run: |
+          if [ "${{ needs.detect-changes.outputs[matrix.service] }}" == "true" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Set up Python 3.9
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+      
+      - name: Cache pip
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov flake8 bandit safety
+      
+      - name: Lint with flake8
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      
+      - name: Security scan with bandit
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: bandit -r . -f json -o bandit-report.json
+      
+      - name: Safety check
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: safety check
+      
+      - name: Test with pytest
+        if: steps.check.outputs.changed == 'true'
+        working-directory: ./src/${{ matrix.service }}
+        run: |
+          python -m pytest --cov=. --cov-report=xml
+      
+      - name: Upload coverage to Codecov
+        if: steps.check.outputs.changed == 'true'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./src/${{ matrix.service }}/coverage.xml
+          flags: ${{ matrix.service }}
+      
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to Docker Hub
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        if: steps.check.outputs.changed == 'true'
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_USERNAME }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/build-push-action@v4
+        with:
+          context: ./src/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Update ArgoCD manifests
+  update-manifests:
+    needs: [
+      detect-changes,
+      build-adservice,
+      build-cartservice,
+      build-go-services,
+      build-nodejs-services,
+      build-python-services
+    ]
+    if: always() && (needs.build-adservice.result == 'success' || needs.build-cartservice.result == 'success' || needs.build-go-services.result == 'success' || needs.build-nodejs-services.result == 'success' || needs.build-python-services.result == 'success' || needs.detect-changes.outputs.kubernetes-manifests == 'true' || needs.detect-changes.outputs.helm-chart == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Update image tags in Helm values
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Get the current commit SHA
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/})
+          
+          # Update Helm values.yaml with new image tags
+          sed -i "s|tag: .*|tag: ${BRANCH_NAME}-${COMMIT_SHA}|g" helm-chart/values.yaml
+          
+          # Update Kubernetes manifests if needed
+          find kubernetes-manifests -name "*.yaml" -exec sed -i "s|:latest|:${BRANCH_NAME}-${COMMIT_SHA}|g" {} \;
+      
+      - name: Commit and push changes
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update image tags to ${GITHUB_SHA:0:7} [skip ci]"
+            git push origin main
+          fi
+
+  # Integration Tests
+  integration-tests:
+    needs: [update-manifests]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.24.0'
+      
+      - name: Run integration tests
+        run: |
+          echo "Running integration tests..."
+          # Add your integration test commands here
+          # For example, you could deploy to a test namespace and run tests
+      
+      - name: Notify ArgoCD
+        run: |
+          echo "Notifying ArgoCD to sync applications..."
+          # You can add ArgoCD CLI commands here to trigger sync if needed
+
+  # Notification
+  notify:
+    needs: [integration-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify on success
+        if: needs.integration-tests.result == 'success'
+        run: |
+          echo "✅ Pipeline completed successfully!"
+          # Add Slack/Teams/Email notification here
+      
+      - name: Notify on failure
+        if: needs.integration-tests.result == 'failure'
+        run: |
+          echo "❌ Pipeline failed!"
+          # Add failure notification here
