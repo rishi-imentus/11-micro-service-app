@@ -1,0 +1,185 @@
+# argocd/application-set.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: microservices-applicationset
+  namespace: argocd
+spec:
+  generators:
+  - list:
+      elements:
+      - name: microservices-app
+        namespace: default
+        repoURL: https://github.com/rishi-imentus/11-micro-service-app.git
+        path: helm-chart
+        targetRevision: main
+  template:
+    metadata:
+      name: '{{name}}'
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: '{{repoURL}}'
+        targetRevision: '{{targetRevision}}'
+        path: '{{path}}'
+        helm:
+          valueFiles:
+          - values.yaml
+          parameters:
+          - name: global.imageRegistry
+            value: docker.io/maven23
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+        - CreateNamespace=true
+        - PrunePropagationPolicy=foreground
+        - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      revisionHistoryLimit: 10
+
+---
+# argocd/app-of-apps.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: microservices-app-of-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/rishi-imentus/11-micro-service-app.git
+    targetRevision: main
+    path: argocd/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+
+---
+# argocd/apps/microservices-prod.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: microservices-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/rishi-imentus/11-micro-service-app.git
+    targetRevision: main
+    path: helm-chart
+    helm:
+      valueFiles:
+      - values.yaml
+      - values-prod.yaml
+      parameters:
+      - name: global.imageRegistry
+        value: docker.io/YOUR_DOCKER_USERNAME
+      - name: global.imagePullPolicy
+        value: Always
+      - name: global.env
+        value: production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: microservices-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+    - CreateNamespace=true
+    - PrunePropagationPolicy=foreground
+    - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 10
+
+---
+# argocd/projects/microservices-project.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: microservices
+  namespace: argocd
+spec:
+  description: Microservices Application Project
+  sourceRepos:
+  - 'https://github.com/rishi-imentus/11-micro-service-app.git'
+  destinations:
+  - namespace: microservices-*
+    server: https://kubernetes.default.svc
+  - namespace: default
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  - group: rbac.authorization.k8s.io
+    kind: ClusterRole
+  - group: rbac.authorization.k8s.io
+    kind: ClusterRoleBinding
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: Service
+  - group: ''
+    kind: ConfigMap
+  - group: ''
+    kind: Secret
+  - group: ''
+    kind: ServiceAccount
+  - group: apps
+    kind: Deployment
+  - group: apps
+    kind: ReplicaSet
+  - group: ''main
+    kind: Pod
+  - group: networking.k8s.io
+    kind: Ingress
+  - group: networking.k8s.io
+    kind: NetworkPolicy
+  - group: policy
+    kind: PodDisruptionBudget
+  - group: autoscaling
+    kind: HorizontalPodAutoscaler
+  roles:
+  - name: microservices-admin
+    description: Admin access to microservices project
+    policies:
+    - p: role:microservices-admin, applications, *, microservices/*, allow
+    - p: role:microservices-admin, repositories, *, *, allow
+    groups:
+    - microservices-team
+  - name: microservices-readonly
+    description: Read-only access to microservices project
+    policies:
+    - p: role:microservices-readonly, applications, get, microservices/*, allow
+    - p: role:microservices-readonly, applications, sync, microservices/*, deny
+    groups:
+    - microservices-viewers
